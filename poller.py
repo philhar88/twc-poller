@@ -65,12 +65,16 @@ def apply_defaults(address):
     logger.debug("Full address after applying defaults: %s", full_address)
     return full_address
 
-def poll_endpoint(address, endpoint, session, stop_event, poll_interval, random_offset_max, api_prefix, redis_stream_key):
+def poll_endpoint(address, endpoint_config, session, stop_event, poll_interval, random_offset_max, api_prefix, redis_stream_key, connector):
     """
     Poll a single endpoint at the specified address with exponential backoff and jitter.
     """
-    url = urljoin(address, api_prefix + endpoint)
-    logger.debug("Polling endpoint: %s", url)
+    # Extract endpoint name and interval from config
+    endpoint_name = endpoint_config['endpoint'] if isinstance(endpoint_config, dict) else endpoint_config
+    endpoint_interval = endpoint_config.get('interval', poll_interval) if isinstance(endpoint_config, dict) else poll_interval
+    
+    url = urljoin(address, api_prefix + endpoint_name)
+    logger.debug("Polling endpoint: %s with interval: %s seconds", url, endpoint_interval)
     backoff_factor = 0.5
     max_backoff = 60  # Max backoff interval in seconds
     retry_attempts = 0
@@ -89,6 +93,10 @@ def poll_endpoint(address, endpoint, session, stop_event, poll_interval, random_
     while not stop_event.is_set():
         start_time = time.time()
         try:
+            # Check stop_event before making request
+            if stop_event.is_set():
+                break
+
             logger.debug("Sending request to: %s", url)
             # Split timeouts into connect and read
             response = session.get(
@@ -105,7 +113,13 @@ def poll_endpoint(address, endpoint, session, stop_event, poll_interval, random_
             redis_max_backoff = 5  # Aggressive retry for Redis, max 5 seconds
             while True:
                 try:
-                    REDIS_CLIENT.xadd(redis_stream_key, {'address': address, 'endpoint': endpoint, 'data': response_data})
+                    REDIS_CLIENT.xadd(redis_stream_key, {
+                        'address': address, 
+                        'endpoint': endpoint_name,  # Use endpoint_name instead of endpoint
+                        'serial_number': connector.get('serial_number', 'UNKNOWN'),
+                        'part_number': connector.get('part_number', 'UNKNOWN'),
+                        'data': response_data,
+                    })
                     logger.debug("Data added to Redis stream %s: %s", redis_stream_key, response_data)
                     break  # Break the retry loop on success
                 except redis.RedisError as e:
@@ -126,12 +140,18 @@ def poll_endpoint(address, endpoint, session, stop_event, poll_interval, random_
             time.sleep(sleep_time)
             continue  # Skip the rest and retry after backoff
         else:
+            # Check stop_event before sleeping
+            if stop_event.is_set():
+                break
+
             # Sleep until next poll, including random offset
             elapsed_time = time.time() - start_time
-            sleep_time = poll_interval - elapsed_time + random.uniform(0, random_offset_max)
+            sleep_time = endpoint_interval - elapsed_time + random.uniform(0, random_offset_max)
             if sleep_time > 0:
-                logger.debug("Sleeping for %.2f seconds before next poll", sleep_time)
-                time.sleep(sleep_time)
+                # Use wait instead of sleep to respond to stop_event
+                stop_event.wait(sleep_time)
+
+    logger.debug("Polling stopped for endpoint %s", endpoint_name)
 
 def start_poller():
     """
@@ -145,40 +165,60 @@ def start_poller():
         if not address:
             logger.debug("Skipping connector with no address.")
             continue
+        
+        # Get default poll interval
+        default_poll_interval = global_config.get('poll_interval', 10)
+        
         endpoints = connector.get('endpoints', global_config.get('default_endpoints', []))
         full_address = apply_defaults(address)
-        session = requests.Session()  # Session for connection pooling
-        for endpoint in endpoints:
+        session = requests.Session()
+        
+        for endpoint_config in endpoints:
             stop_event = threading.Event()
             thread = threading.Thread(
                 target=poll_endpoint,
                 args=(
                     full_address,
-                    endpoint,
+                    endpoint_config,  # Pass the entire endpoint config
                     session,
                     stop_event,
-                    global_config.get('poll_interval', 1),
+                    default_poll_interval,
                     global_config.get('random_offset_max', 0.1),
                     global_config.get('api_prefix', '/api/1/'),
-                    redis_config.get('stream', 'wall_connector_data')
+                    redis_config.get('stream', 'wall_connector_data'),
+                    connector
                 )
             )
             thread.daemon = True
             threads.append((thread, stop_event))
             thread.start()
-            logger.info("Started polling thread for %s, endpoint %s", full_address, endpoint)
+            
+            # Get endpoint name for logging
+            endpoint_name = endpoint_config['endpoint'] if isinstance(endpoint_config, dict) else endpoint_config
+            endpoint_interval = endpoint_config.get('interval', default_poll_interval) if isinstance(endpoint_config, dict) else default_poll_interval
+            
+            logger.info("Started polling thread for %s, endpoint %s with poll interval %s seconds", 
+                       full_address, endpoint_name, endpoint_interval)
 
 def stop_poller():
     """
-    Stop all polling threads.
+    Stop all polling threads with timeout.
     """
     logger.debug("Stopping all polling threads.")
     global threads
-    for thread, stop_event in threads:
+    
+    # Set all stop events
+    for _, stop_event in threads:
         stop_event.set()
+    
+    # Join threads with timeout
     for thread, _ in threads:
-        thread.join()
-    threads = []
+        thread.join(timeout=2)  # Wait up to 2 seconds per thread
+        if thread.is_alive():
+            logger.warning("Thread %s did not stop gracefully", thread.name)
+    
+    # Clear the threads list
+    threads.clear()
     logger.info("All polling threads have been stopped.")
 
 def check_redis_connection():
@@ -315,7 +355,13 @@ def main():
         logger.info("Shutting down poller...")
         with config_lock:
             stop_poller()
+        logger.info("Shutdown complete")
         sys.exit(0)
+    except Exception as e:
+        logger.error("Unexpected error: %s", e)
+        with config_lock:
+            stop_poller()
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
