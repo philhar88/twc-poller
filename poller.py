@@ -75,14 +75,30 @@ def poll_endpoint(address, endpoint, session, stop_event, poll_interval, random_
     max_backoff = 60  # Max backoff interval in seconds
     retry_attempts = 0
 
+    # Configure the session with better timeout and pooling settings
+    session.headers.update({'Connection': 'keep-alive'})
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=10,    # Number of connection pools to cache
+        pool_maxsize=10,       # Number of connections to save in the pool
+        max_retries=0,         # We handle retries ourselves
+        pool_block=False       # Don't block when pool is full
+    )
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+
     while not stop_event.is_set():
         start_time = time.time()
         try:
             logger.debug("Sending request to: %s", url)
-            response = session.get(url, timeout=5)
+            # Split timeouts into connect and read
+            response = session.get(
+                url,
+                timeout=(3.05, 27),  # (connect timeout, read timeout) in seconds
+            )
             response.raise_for_status()
-            response_data = response.text  # Get the raw response text
+            response_data = response.text
             logger.debug("Received response: %s", response_data)
+            
             # Add to Redis stream with retry logic
             redis_retry_attempts = 0
             redis_backoff_factor = 0.5
