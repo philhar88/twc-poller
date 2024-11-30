@@ -86,7 +86,7 @@ def poll_endpoint(address, endpoint_config, session, stop_event, poll_interval, 
     class DebugHTTPAdapter(requests.adapters.HTTPAdapter):
         def get_connection(self, url, proxies=None):
             conn = super().get_connection(url, proxies)
-            logger.debug("Connection reuse for %s: %s", url, conn.is_reused())
+            logger.debug("Connection for %s: %s", url, id(conn))
             return conn
     
     adapter = DebugHTTPAdapter(
