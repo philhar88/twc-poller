@@ -98,6 +98,21 @@ def poll_endpoint(address, endpoint_config, session, stop_event, poll_interval, 
     session.mount('http://', adapter)
     session.mount('https://', adapter)
 
+    def create_new_session():
+        new_session = requests.Session()
+        new_session.headers.update({'Connection': 'keep-alive'})
+        adapter = DebugHTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=10,
+            max_retries=0,
+            pool_block=False
+        )
+        new_session.mount('http://', adapter)
+        new_session.mount('https://', adapter)
+        return new_session
+
+    session = create_new_session()
+
     while not stop_event.is_set():
         start_time = time.time()
         try:
@@ -140,6 +155,11 @@ def poll_endpoint(address, endpoint_config, session, stop_event, poll_interval, 
             retry_attempts = 0
         except Exception as e:
             logger.error("Error polling %s: %s", url, e)
+            # Close and recreate session on failure
+            session.close()
+            session = create_new_session()
+            logger.debug("Recreated HTTP session after error")
+            
             # Exponential backoff with jitter
             retry_attempts += 1
             sleep_time = min(max_backoff, (2 ** retry_attempts) * backoff_factor)
